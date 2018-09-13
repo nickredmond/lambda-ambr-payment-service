@@ -98,9 +98,9 @@ function processPayment(db, user, paymentRequest, callback) {
         function(stripeSecretKey) {
             const stripe = require("stripe")(stripeSecretKey);
             if (paymentRequest.isNewPaymentMethod) {
-                saveNewPaymentMethod(db, user, paymentRequest.paymentMethod, callback);
+                saveNewPaymentMethod(db, user, paymentRequest, callback);
             } else {
-                submitPaymentToStripe(stripe, paymentRequest.paymentMethod.tokenId, paymentRequest.paymentAmount, callback);
+                saveIntendedPayment(db, user, paymentRequest.paymentMethod.tokenId, paymentRequest.bidType, auctionId, paymentRequest.paymentAmount, callback);
             }
         },
         function(err) {
@@ -108,39 +108,178 @@ function processPayment(db, user, paymentRequest, callback) {
         }
     );
 }
-function saveNewPaymentMethod(db, user, stripe, paymentMethod, callback) {
+function saveNewPaymentMethod(db, user, stripe, paymentRequest, callback) {
     const updatedPaymentMethods = user.paymentMethods || [];
     const customer = {
-        source: paymentMethod.tokenId,
+        source: paymentRequest.paymentMethod.tokenId,
         email: user.email
     };
     stripe.customers.create(customer, function(err, customer) {
         if (err) {
             handleStripeApiError(err, callback);
         } else {
-            // save customer.id as paymentMethod tokenId, as part of new paymentMethod in updated""Methods
-            // submit payment to Stripe
+            const newPaymentMethod = {
+                tokenId: customer.id,
+                lastFourDigits: paymentRequest.paymentMethod.lastFourDigits,
+                cardBrand: paymentRequest.paymentMethod.cardBrand
+            };
+            updatedPaymentMethods.push(newPaymentMethod);
+
+            db.collection("users").updateOne(
+                { email: user.email },
+                { $set: { paymentMethods: updatedPaymentMethods } },
+                function(err, result) {
+                    if (err) {
+                        const messageBody = {
+                            isErrorSavingNewCard: true
+                        };
+                        sendResponseToApiGateway(messageBody, 500, callback);
+                    } else {
+                        saveIntendedPayment(db, user, customer.id, paymentRequest.bidType, paymentRequest.auctionId, paymentRequest.paymentAmount, callback);
+                    }
+                }
+            );
         }
     });
 }
-function submitPaymentToStripe(stripe, customerId, paymentAmount, callback) {
-    const charge = {
-        amount: paymentAmount,
-        currency: "usd",
-        description: "Ambr auction bid/donation",
-        customer: customerId
+
+// goto "Payment info stored! See results."
+// then, isHighestBid and highestBidAmount are returned
+// should everyone's money be refuneded if not enough $$$ is raised? (will be refunded if auction is canceled)
+// for added/donated items, there is NO minimum fundraising requirement, i.e. highest bidder gets it (perhaps set max requirement, or "limit"?)
+function saveIntendedPayment(db, user, stripeCustomerId, bidType, auctionId, amount, callback) {
+    // get highest bid and compare
+    // add bid permission based on donateType: 
+    //  - if bid then add user bidPermission[bidId=nowHighestBid.id, auctionId]
+    //  - if donate then add user bidPermission[bidId=null, auctionId]
+    const payment = {
+        userId: user._id,
+        stripeCustomerId,
+        bidType,
+        auctionId,
+        amount,
+        status: "pending"
     };
-    stripe.charges.create(charge, function(err, charge) {
+    db.collection("payments").insertOne(payment, function(err, result) {
         if (err) {
-            handleStripeApiError(err, callback);
+            console.log("ERROR saving payment submission for user " + user._id.toString(), err);
+            sendResponseToApiGateway("ERROR saving payment submission.", 500, callback);
         } else {
-            // record transaction
-            // return success to front-end
+            evaluateHighestBid(db, user, auctionId, amount, bidType, callback);
         }
     });
 }
+function evaluateHighestBid(db, user, auctionId, amount, bidType, callback) {
+    db.collection("auctions").findOne({ _id: { $eq: auctionId } }, function(err, auction) {
+        if (err) {
+            console.log("ERROR finding auction by ID " + auctionId, err);
+            sendResponseToApiGateway("ERROR finding auction by id " + auctionId, 500, callback);
+        } else {
+            const isHighestBid = auction.highestBid ? auction.highestBid.amount < amount : true;
+            let highestBid = auction.highestBid;
+            if (isHighestBid) {
+                highestBid = {
+                    userId: user._id,
+                    amount: amount
+                };
+                db.collection("auctions").updateOne(
+                    { _id: { $eq: auctionId } },
+                    { $set: { highestBid: highestBid } },
+                    function(err, result) {
+                        if (err) {
+                            console.log("ERROR setting highest bid for user " + user._id.toString(), err);
+                            sendResponseToApiGateway("ERROR setting highest bid [userId:" + user._id + ", amount:" + amount + "]", 500, callback);
+                        } else {
+                            updateBidViewingPermission(db, user, auctionId, bidType, amount, true, callback);
+                        }
+                    }
+                );
+            } else {
+                updateBidViewingPermission(db, user, auctionId, bidType, highestBid.amount, false, callback);
+            }
+        }
+    });
+}
+function updateBidViewingPermission(db, user, auctionId, bidType, highestBidAmount, isHighestBid, callback) {
+    let permission = null;
+    const MINUTES_TIL_EXPIRY = 5;
+
+    if (bidType === "bid") {
+        const MILLIS_PER_MINUTE = 60000;
+        const MILLIS_TIL_EXPIRY = MINUTES_TIL_EXPIRY * MILLIS_PER_MINUTE;
+        const expiryDate = new Date(new Date().getTime() + MILLIS_TIL_EXPIRY);
+
+        permission = { auctionId, expiry: expiryDate };
+    } else if (bidType === "donation") {
+        permission = { auctionId, expiry: null };
+    }
+
+    if (permission) {
+        const updatedPermissions = user.bidViewPermissions ? user.bidViewPermissions.filter(permission => {
+            return permission.auctionId !== auctionId;
+        }) : [];
+        updatedPermissions.push(permission);
+
+        db.collection("users").updateOne(
+            { _id: { $eq: user._id } },
+            { $set: { bidViewPermissions: updatedPermissions } },
+            function(err, result) {
+                if (err) {
+                    console.log("ERROR updating user[" + user._id + "] bid view permissions." + JSON.stringify(err));
+                    sendResponseToApiGateway("ERROR updating user's permissions to view bids.", 500, callback);
+                } else {
+                    if (!result) {
+                        console.log("ERROR finding user[" + user._id + "] to give bid permissions.");
+                    }
+                    
+                    var responseBody = {
+                        highestBidAmount,
+                        isHighestBid,
+                        isPermissionExpires: !(isHighestBid || bidType === "donation")
+                    };
+                    sendResponseToApiGateway(responseBody, 200, callback);
+                } 
+            }
+        );
+    }
+}
+
+// function submitPaymentToStripe(stripe, customerId, paymentAmount, callback) {
+//     const charge = {
+//         amount: paymentAmount,
+//         currency: "usd",
+//         description: "Ambr auction bid/donation",
+//         customer: customerId
+//     };
+//     stripe.charges.create(charge, function(err, charge) {
+//         if (err) {
+//             handleStripeApiError(err, callback);
+//         } else {
+//             // record transaction/charge (see Stripe API for what's recorded)
+//             // return success to front-end
+//         }
+//     });
+// }
+
 function handleStripeApiError(err, callback) {
-    // todo: handle this
+    console.log("ERROR returned from Stripe API: " + JSON.stringify(err));
+
+    if (err.type === "StripeCardError") {
+        var messageBody = {
+            isCardDeclined: true
+        };
+        sendResponseToApiGateway(messageBody, 400, callback);
+    } else if (err.type === "RateLimitError") {
+        var messageBody = {
+            isRateLimitTooHigh: true
+        };
+        sendResponseToApiGateway(messageBody, 500, callback);
+    } else {
+        var messageBody = {
+            isUnknownError: true
+        };
+        sendResponseToApiGateway(messageBody, 500, callback);
+    }
 }
 
 function findUserByEmail(db, emailAddress, onSuccess, onError) {
