@@ -2,7 +2,10 @@
 
 const AWS = require("aws-sdk");
 const jwt = require("jsonwebtoken");
-var MongoClient = require("mongodb").MongoClient;
+
+var mongodb = require("mongodb");
+const ObjectId = mongodb.ObjectID;
+const MongoClient = mongodb.MongoClient;
 
 let atlas_connection_uri;
 let cachedDb = null;
@@ -98,9 +101,9 @@ function processPayment(db, user, paymentRequest, callback) {
         function(stripeSecretKey) {
             const stripe = require("stripe")(stripeSecretKey);
             if (paymentRequest.isNewPaymentMethod) {
-                saveNewPaymentMethod(db, user, paymentRequest, callback);
+                saveNewPaymentMethod(db, user, stripe, paymentRequest, callback);
             } else {
-                saveIntendedPayment(db, user, paymentRequest.paymentMethod.tokenId, paymentRequest.bidType, auctionId, paymentRequest.paymentAmount, callback);
+                saveIntendedPayment(db, user, paymentRequest.paymentMethod.tokenId, paymentRequest.bidType, paymentRequest.auctionId, paymentRequest.paymentAmount, callback);
             }
         },
         function(err) {
@@ -170,7 +173,7 @@ function saveIntendedPayment(db, user, stripeCustomerId, bidType, auctionId, amo
     });
 }
 function evaluateHighestBid(db, user, auctionId, amount, bidType, callback) {
-    db.collection("auctions").findOne({ _id: { $eq: auctionId } }, function(err, auction) {
+    db.collection("auctions").findOne({ _id: ObjectId(auctionId) }, function(err, auction) {
         if (err) {
             console.log("ERROR finding auction by ID " + auctionId, err);
             sendResponseToApiGateway("ERROR finding auction by id " + auctionId, 500, callback);
@@ -235,7 +238,7 @@ function updateBidViewingPermission(db, user, auctionId, bidType, highestBidAmou
                     var responseBody = {
                         highestBidAmount,
                         isHighestBid,
-                        isPermissionExpires: !(isHighestBid || bidType === "donation")
+                        isPermissionExpires: bidType !== "donation"
                     };
                     sendResponseToApiGateway(responseBody, 200, callback);
                 } 
